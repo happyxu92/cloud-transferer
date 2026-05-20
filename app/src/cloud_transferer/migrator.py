@@ -73,7 +73,8 @@ async def scan_job(client: AListClient, job_id: int) -> int:
     # 列出目的根（用于增量判断）。失败也无所谓，按未存在处理。
     dst_index: dict[str, int] = {}  # full_path -> size
     try:
-        dst_files = await client.list_dir_recursive(dst_path, refresh=False)
+        # 目标端容易命中 AList 缓存，增量判断需要强制刷新避免漏判已存在文件。
+        dst_files = await client.list_dir_recursive(dst_path, refresh=True)
         dst_index = {f.path: f.size for f in dst_files}
     except AListError as e:
         logger.warning(f"[job {job_id}] 目的目录扫描失败（视为全部未存在）: {e}")
@@ -175,6 +176,17 @@ def _mark_success(ft_id: int) -> None:
         s.add(ft)
 
 
+def _mark_skipped(ft_id: int, reason: str) -> None:
+    with session_scope() as s:
+        ft = s.get(FileTask, ft_id)
+        if not ft:
+            return
+        ft.status = TaskStatus.SKIPPED
+        ft.finished_at = datetime.utcnow()
+        ft.last_error = reason[:500]
+        s.add(ft)
+
+
 def _reset_pending(ft_id: int, err: str = "") -> None:
     with session_scope() as s:
         ft = s.get(FileTask, ft_id)
@@ -234,6 +246,14 @@ async def _copy_one(client: AListClient, ft_id: int) -> None:
     try:
         task_ids = await client.copy(src_dir, dst_dir, [name])
     except AListError as e:
+        err_text = str(e).lower()
+        if settings.exists_policy == "skip" and "exists" in err_text:
+            if await _verify_dst(client, dst_full, size):
+                _mark_skipped(ft_id, "目的已存在同名同大小文件")
+                logger.info(f"[task {ft_id}] 跳过已存在文件 {dst_full}")
+                return
+            _record_failure(ft_id, f"目标已存在但大小不匹配: {e}")
+            return
         _record_failure(ft_id, f"copy 触发失败: {e}")
         return
 
@@ -386,14 +406,25 @@ async def _find_task_id_by_name(client: AListClient, name: str) -> str | None:
     return None
 
 
-async def _verify_dst(client: AListClient, path: str, expect_size: int) -> bool:
-    # 给夸克侧少量时间刷新
-    for _ in range(3):
+async def _verify_dst(
+    client: AListClient,
+    path: str,
+    expect_size: int,
+    *,
+    timeout_sec: int = 10,
+    poll_interval: float = 3.0,
+) -> bool:
+    # AList 后台任务完成后，夸克侧目录刷新经常会滞后几秒到几十秒。
+    # 这里按总超时轮询，避免把已成功复制误判为校验失败并触发重试。
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
         info = await client.get(path)
         if info and int(info.get("size") or 0) == expect_size:
             return True
-        await asyncio.sleep(2)
-    return False
+        await asyncio.sleep(poll_interval)
+
+    info = await client.get(path)
+    return bool(info and int(info.get("size") or 0) == expect_size)
 
 
 async def _safe_delete_task(client: AListClient, task_id: str) -> None:

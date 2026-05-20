@@ -3,10 +3,12 @@ services:
     image: xhofe/alist:latest
     container_name: ct-alist
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "-lc", "update-ca-certificates && exec /entrypoint.sh"]
     ports:
       - "5244:5244"
     volumes:
       - ./alist/data:/opt/alist/data
+      - ./alist/certs/starpoint-root-ca-2048-g2.pem:/usr/local/share/ca-certificates/starpoint-root-ca-2048-g2.crt:ro
     environment:
       - PUID=0
       - PGID=0

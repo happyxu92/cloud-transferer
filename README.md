@@ -52,6 +52,36 @@ docker compose up -d
 docker compose logs -f alist     # 等待 "Start HTTP server @ :5244"
 ```
 
+### 2.1 重启与让新代码生效
+
+日常重启容器：
+
+```bash
+docker compose restart alist
+docker compose restart migrator
+```
+
+如果修改了 `app/` 下的 Python 代码，需要重建 `migrator` 镜像后再启动：
+
+```bash
+docker compose build migrator
+docker compose up -d migrator
+```
+
+如果同时改了 `docker-compose.yml`、`Dockerfile` 或依赖，建议直接重建并拉起全部服务：
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+重启后可用下面命令确认服务正常：
+
+```bash
+docker compose ps
+docker compose exec migrator ct doctor
+```
+
 首次启动后查看 AList 的 admin 初始密码（若未在 .env 设过）：
 
 ```bash
