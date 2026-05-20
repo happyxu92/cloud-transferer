@@ -1,0 +1,31 @@
+services:
+  alist:
+    image: xhofe/alist:latest
+    container_name: ct-alist
+    restart: unless-stopped
+    ports:
+      - "5244:5244"
+    volumes:
+      - ./alist/data:/opt/alist/data
+    environment:
+      - PUID=0
+      - PGID=0
+      - UMASK=022
+      - TZ=Asia/Shanghai
+
+  migrator:
+    build: ./app
+    container_name: ct-migrator
+    restart: unless-stopped
+    depends_on:
+      - alist
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      - ALIST_BASE=http://alist:5244
+    volumes:
+      - ./app/data:/data
+      # 暴露 AList 的 temp 目录给 migrator 做磁盘哨兵
+      - ./alist/data:/alist-data:ro
+    command: ["run"]

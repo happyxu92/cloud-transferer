@@ -1,0 +1,19 @@
+.env
+*.pyc
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.DS_Store
+
+# 运行时数据
+alist/data/*
+!alist/data/.gitkeep
+app/data/*
+!app/data/.gitkeep
