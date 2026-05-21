@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 from loguru import logger
+from sqlalchemy import func
 from sqlmodel import select
 
 from .alist_client import (
@@ -160,9 +161,35 @@ def _record_failure(ft_id: int, err: str) -> None:
             ft.finished_at = datetime.utcnow()
             # 失败任务结构化日志
             _append_failed_log(ft)
+            logger.error(
+                f"[task {ft_id}] 失败，停止重试 "
+                f"({ft.retry_count}/{settings.max_retry}) {ft.dst_full_path}: {ft.last_error}"
+            )
         else:
             ft.status = TaskStatus.PENDING
+            logger.warning(
+                f"[task {ft_id}] 失败，重新加入 pending 等待重试 "
+                f"({ft.retry_count}/{settings.max_retry}) {ft.dst_full_path}: {ft.last_error}"
+            )
         s.add(ft)
+
+
+def _claim_next_pending(job_id: int) -> int | None:
+    with session_scope() as s:
+        ft = s.exec(
+            select(FileTask)
+            .where(
+                FileTask.job_id == job_id,
+                FileTask.status == TaskStatus.PENDING,
+            )
+            .order_by(FileTask.id)
+        ).first()
+        if not ft or ft.id is None:
+            return None
+        ft.status = TaskStatus.COPYING
+        ft.started_at = datetime.utcnow()
+        s.add(ft)
+        return ft.id
 
 
 def _mark_success(ft_id: int) -> None:
@@ -217,14 +244,103 @@ def _append_failed_log(ft: FileTask) -> None:
         logger.warning(f"写失败日志失败: {e}")
 
 
-async def _copy_one(client: AListClient, ft_id: int) -> None:
+def _get_job_task_counts(job_id: int) -> dict[TaskStatus, int]:
+    with session_scope() as s:
+        rows = s.exec(
+            select(FileTask.status, func.count())
+            .where(FileTask.job_id == job_id)
+            .group_by(FileTask.status)
+        ).all()
+    return {status: int(cnt) for status, cnt in rows}
+
+
+def _update_job_summary(job_id: int, *, active_copying: int = 0) -> None:
+    counts = _get_job_task_counts(job_id)
+    pending = counts.get(TaskStatus.PENDING, 0)
+    copying = counts.get(TaskStatus.COPYING, 0)
+    success = counts.get(TaskStatus.SUCCESS, 0)
+    failed = counts.get(TaskStatus.FAILED, 0)
+    skipped = counts.get(TaskStatus.SKIPPED, 0)
+    oversize = counts.get(TaskStatus.OVERSIZE, 0)
+    total = sum(counts.values())
+
+    with session_scope() as s:
+        job = s.get(MigrationJob, job_id)
+        if not job:
+            return
+
+        if total == 0:
+            if job.status in {JobStatus.RUNNING, JobStatus.SCANNING}:
+                job.status = JobStatus.IDLE
+                job.last_message = "执行中断，待重新运行"
+                job.updated_at = datetime.utcnow()
+                s.add(job)
+            return
+
+        if active_copying > 0:
+            job.status = JobStatus.RUNNING
+            job.last_message = f"正在迁移... 活跃 {active_copying}，待处理 {pending}"
+        elif pending > 0 or copying > 0:
+            job.status = JobStatus.IDLE
+            job.last_message = f"执行中断，待重新运行: 待处理 {pending + copying}"
+        elif failed == 0:
+            job.status = JobStatus.DONE
+            job.last_message = (
+                f"完成: 共{total} 成功{success} 跳过{skipped} "
+                f"超大{oversize} 失败{failed}"
+            )
+        else:
+            job.status = JobStatus.ERROR
+            job.last_message = (
+                f"完成: 共{total} 成功{success} 跳过{skipped} "
+                f"超大{oversize} 失败{failed}"
+            )
+
+        job.updated_at = datetime.utcnow()
+        s.add(job)
+
+
+def mark_job_interrupted(job_id: int) -> None:
+    with session_scope() as s:
+        rows = s.exec(
+            select(FileTask).where(
+                FileTask.job_id == job_id,
+                FileTask.status == TaskStatus.COPYING,
+                FileTask.alist_task_id == "",
+            )
+        ).all()
+        for ft in rows:
+            ft.status = TaskStatus.PENDING
+            ft.started_at = None
+            ft.finished_at = None
+            ft.last_error = "执行中断，等待恢复"
+            s.add(ft)
+
+    counts = _get_job_task_counts(job_id)
+    active_copying = counts.get(TaskStatus.COPYING, 0)
+
+    with session_scope() as s:
+        job = s.get(MigrationJob, job_id)
+        if not job:
+            return
+        if active_copying > 0:
+            job.status = JobStatus.RUNNING
+        elif counts.get(TaskStatus.PENDING, 0) > 0:
+            job.status = JobStatus.IDLE
+        job.last_message = "执行已中断，可重新运行以恢复"
+        job.updated_at = datetime.utcnow()
+        s.add(job)
+
+
+async def _copy_one(client: AListClient, ft_id: int, *, already_claimed: bool = False) -> None:
     with session_scope() as s:
         ft = s.get(FileTask, ft_id)
         if not ft:
             return
-        ft.status = TaskStatus.COPYING
-        ft.started_at = datetime.utcnow()
-        s.add(ft)
+        if not already_claimed:
+            ft.status = TaskStatus.COPYING
+            ft.started_at = datetime.utcnow()
+            s.add(ft)
         src_full = ft.src_full_path
         dst_full = ft.dst_full_path
         size = ft.size_bytes
@@ -282,11 +398,33 @@ async def _finish_copy_task(
 
     # 轮询
     try:
-        task = await client.wait_task(
-            task_id,
-            timeout_sec=settings.task_timeout_sec,
-            poll_interval=5.0,
-        )
+        deadline = time.time() + settings.task_timeout_sec
+        task: CopyTask | None = None
+        missing_checks = 0
+        while time.time() < deadline:
+            task = await client.get_copy_task(task_id)
+            if task is None:
+                missing_checks += 1
+                if missing_checks >= 2 and await _verify_dst(client, dst_full, size):
+                    _mark_success(ft_id)
+                    logger.success(f"[task {ft_id}] 成功 {dst_full}")
+                    return
+            else:
+                missing_checks = 0
+                if task.state in FINISHED_STATES:
+                    break
+            await asyncio.sleep(5.0)
+
+        if task is None:
+            if await _verify_dst(client, dst_full, size):
+                _mark_success(ft_id)
+                logger.success(f"[task {ft_id}] 成功 {dst_full}")
+                return
+            raise TimeoutError(f"任务 {task_id} 在 AList 中未找到")
+        if task.state not in FINISHED_STATES:
+            raise TimeoutError(
+                f"任务 {task_id} 超时未完成 (state={task.state}, progress={task.progress:.1f})"
+            )
     except TimeoutError as e:
         _record_failure(ft_id, str(e))
         return
@@ -415,16 +553,33 @@ async def _verify_dst(
     poll_interval: float = 3.0,
 ) -> bool:
     # AList 后台任务完成后，夸克侧目录刷新经常会滞后几秒到几十秒。
-    # 这里按总超时轮询，避免把已成功复制误判为校验失败并触发重试。
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
+    # 仅调用 fs/get 仍可能命中旧缓存，这里补一次 refresh=True 的目录级校验，
+    # 避免把已成功复制误判为失败并触发重试。
+    parent = str(PurePosixPath(path).parent)
+    name = PurePosixPath(path).name
+
+    async def _exists_with_expected_size() -> bool:
         info = await client.get(path)
         if info and int(info.get("size") or 0) == expect_size:
             return True
+
+        try:
+            entries = await client.list_dir(parent, refresh=True)
+        except AListError:
+            return False
+
+        for entry in entries:
+            if entry.name == name and int(entry.size or 0) == expect_size:
+                return True
+        return False
+
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if await _exists_with_expected_size():
+            return True
         await asyncio.sleep(poll_interval)
 
-    info = await client.get(path)
-    return bool(info and int(info.get("size") or 0) == expect_size)
+    return await _exists_with_expected_size()
 
 
 async def _safe_delete_task(client: AListClient, task_id: str) -> None:
@@ -449,45 +604,61 @@ async def run_job(client: AListClient, job_id: int) -> None:
         job.last_message = "正在迁移..."
         s.add(job)
 
-    sem = asyncio.Semaphore(settings.max_concurrency)
+    with session_scope() as s:
+        pending = s.exec(
+            select(func.count()).select_from(FileTask).where(
+                FileTask.job_id == job_id,
+                FileTask.status == TaskStatus.PENDING,
+            )
+        ).one()
+    if pending:
+        logger.info(f"[job {job_id}] 本轮待处理 {pending} 个文件")
 
-    async def worker(ft_id: int) -> None:
-        async with sem:
-            if should_pause():
-                # 等待直到磁盘恢复或循环上限
-                for _ in range(60):
-                    await asyncio.sleep(30)
-                    if not should_pause():
-                        break
-            await _copy_one(client, ft_id)
+    resume_queue: asyncio.Queue[int] = asyncio.Queue()
+    for ft_id in active_copying:
+        resume_queue.put_nowait(ft_id)
 
-    async def resume_worker(ft_id: int) -> None:
-        async with sem:
-            await _resume_copy_one(client, ft_id)
+    async def wait_if_paused() -> None:
+        if should_pause():
+            # 等待直到磁盘恢复或循环上限
+            for _ in range(60):
+                await asyncio.sleep(30)
+                if not should_pause():
+                    break
 
-    if active_copying:
-        await asyncio.gather(*(resume_worker(rid) for rid in active_copying))
+    async def worker(slot: int) -> None:
+        while True:
+            next_id: int | None = None
+            try:
+                ft_id = resume_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                ft_id = None
 
-    # 循环直到没有 pending 任务（处理重试导致的回流）
-    while True:
-        with session_scope() as s:
-            rows = s.exec(
-                select(FileTask.id).where(
-                    FileTask.job_id == job_id,
-                    FileTask.status == TaskStatus.PENDING,
-                )
-            ).all()
-        if not rows:
-            break
-        logger.info(f"[job {job_id}] 本轮待处理 {len(rows)} 个文件")
-        await asyncio.gather(*(worker(rid) for rid in rows))
-        # 让 DB 状态稳定
-        await asyncio.sleep(1)
+            try:
+                if ft_id is not None:
+                    await _resume_copy_one(client, ft_id)
+                    continue
+
+                await wait_if_paused()
+                next_id = _claim_next_pending(job_id)
+                if next_id is None:
+                    return
+
+                await _copy_one(client, next_id, already_claimed=True)
+            except Exception as e:
+                failed_id = ft_id if ft_id is not None else next_id
+                if failed_id is not None:
+                    _record_failure(failed_id, f"未捕获异常: {e}")
+                logger.exception(f"[job {job_id}] worker {slot} 执行异常: {e}")
+
+    await asyncio.gather(
+        *(worker(slot) for slot in range(max(1, settings.max_concurrency)))
+    )
+    # 让 DB 状态稳定
+    await asyncio.sleep(1)
 
     # 汇总
     with session_scope() as s:
-        from sqlalchemy import func
-
         total = s.exec(
             select(func.count()).select_from(FileTask).where(
                 FileTask.job_id == job_id

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -48,7 +49,25 @@ class CopyTask:
     name: str
     state: int          # AList task state: 0 pending, 1 running, 2 success, 7 failed ...
     progress: float
+    status: str = ""
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    total_bytes: int = 0
     error: str | None = None
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 # AList 任务状态码（来自 alist/internal/task）
@@ -283,7 +302,11 @@ class AListClient:
                     id=str(it.get("id")),
                     name=it.get("name", ""),
                     state=int(it.get("state", 0)),
+                    status=it.get("status", "") or "",
                     progress=float(it.get("progress", 0) or 0),
+                    start_time=_parse_time(it.get("start_time")),
+                    end_time=_parse_time(it.get("end_time")),
+                    total_bytes=int(it.get("total_bytes", 0) or 0),
                     error=it.get("error") or None,
                 )
             )
@@ -303,24 +326,11 @@ class AListClient:
         except AListError as e:
             logger.debug(f"删除任务 {tid} 失败（可忽略）: {e}")
 
-    async def wait_task(
-        self, task_id: str, *, timeout_sec: int, poll_interval: float = 5.0
-    ) -> CopyTask:
-        """轮询单个 task 直到完成。"""
-        deadline = time.time() + timeout_sec
-        last: CopyTask | None = None
-        while time.time() < deadline:
-            undone = await self.list_undone_copy()
-            done = await self.list_done_copy()
-            for t in undone + done:
-                if t.id == task_id:
-                    last = t
-                    if t.state in FINISHED_STATES:
-                        return t
-                    break
-            await asyncio.sleep(poll_interval)
-        if last is None:
-            raise TimeoutError(f"任务 {task_id} 在 AList 中未找到")
-        raise TimeoutError(
-            f"任务 {task_id} 超时未完成 (state={last.state}, progress={last.progress:.1f})"
-        )
+    async def get_copy_task(self, task_id: str) -> CopyTask | None:
+        for t in await self.list_undone_copy():
+            if t.id == task_id:
+                return t
+        for t in await self.list_done_copy():
+            if t.id == task_id:
+                return t
+        return None

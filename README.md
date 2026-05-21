@@ -166,7 +166,7 @@ ct job rm ID                               删除任务及其文件记录
 
 ct task list   [--job ID] [--status XXX]   文件级任务列表
 ct task stats  [--job ID]                  按状态汇总（含容量）
-ct task progress [--job ID]                查看 copying 任务实时进度
+ct task progress [--job ID]                持续刷新查看 copying 任务实时进度和速度（Ctrl+C 退出）
 ct task retry  [--job ID] [--include-oversize]  把 failed 重置为 pending
 ```
 
@@ -203,7 +203,7 @@ ct task retry  [--job ID] [--include-oversize]  把 failed 重置为 pending
 | `doctor` 显示百度目录失败 | refresh_token 失效，去 AList web 重新生成 |
 | `doctor` 显示夸克目录失败 | Cookie 失效，重新从浏览器复制并更新 driver |
 | 任务状态长期 `copying` | 查 `docker compose logs alist`，可能百度限速或被风控；可重启 alist 容器 |
-| 想看当前复制进度 | 运行 `docker compose exec migrator ct task progress --job ID` |
+| 想看当前复制进度和速度 | 运行 `docker compose exec migrator ct task progress --job ID`，命令会持续刷新，`Ctrl+C` 退出 |
 | `ct job run` 被中断后仍显示 `running/copying` | 直接重新执行 `docker compose exec migrator ct job run ID`，会自动恢复或重置中断的任务 |
 | `磁盘占用 X% 暂停新任务` | AList temp 没有及时清理，先停 migrator，进 alist 容器删除 `/opt/alist/data/temp/*` |
 | 大量 `failed` 任务 | `ct task list --status failed`，常见为夸克 cookie 过期；处理后 `ct task retry --job ID` |
